@@ -4,7 +4,7 @@ The application requires GO version `1.14` or higher to run.
 ### Running it
 
 #### Download release
-Download a pre-compiled binary from the [releases](https://github.com/rolandvarga/batch_proc/releases/) section of this repository.
+Download one of the binaries from the [releases](https://github.com/rolandvarga/batch_proc/releases/) section of this repository.
 
 The following systems are currently supported:
 * Linux

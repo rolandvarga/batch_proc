@@ -7,6 +7,45 @@ import (
 	"github.com/rolandvarga/batch_proc/job"
 )
 
+func TestGetIndex(t *testing.T) {
+	var cases = []struct {
+		input int64
+		want  int64
+	}{
+		{0, 0},
+		{1, 1},
+		{99, 99},
+		{100, 0},
+		{110, 10},
+		{200, 0},
+		{201, 1},
+
+		{301, 1},
+		{309, 9},
+		{310, 10},
+		{350, 50},
+		{399, 99},
+
+		{1051, 51},
+		{1151, 51},
+
+		{19365, 65},
+		{19465, 65},
+
+		{49999, 99},
+		{50000, 0},
+	}
+
+	for _, c := range cases {
+		obj := job.Object{Seq: c.input}
+
+		got := obj.GetIndex()
+		if got != c.want {
+			t.Errorf("got '%d' want '%d'", got, c.want)
+		}
+	}
+}
+
 func TestGenerateGroupID(t *testing.T) {
 	var cases = []struct {
 		input int64

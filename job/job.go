@@ -2,25 +2,17 @@ package job
 
 import (
 	"fmt"
-	"sort"
+	"time"
+
+	"gopkg.in/Shopify/sarama.v1"
 )
 
 var (
-	batchSize = 100
+	batchSize       = 100
+	numberOfWorkers = 500
+	numberOfJobs    = 50000
+	topic           = "batch_proc"
 )
-
-// Object represents a single element in our input data.
-type Object struct {
-	ID   string `json:"id"`
-	Seq  int64  `json:"seq"`
-	Data string `json:"data"`
-}
-
-// GenerateGroupID returns the groupID that each object is grouped under
-// when assigned to a worker.
-func (o *Object) GenerateGroupID() int64 {
-	return o.Seq / 100
-}
 
 // Data represents a collection of objects from our input data.
 type Data struct {
@@ -35,84 +27,126 @@ type Job struct {
 
 // NewJob initializes a new Job instance
 func NewJob(data Data) Job {
-	return Job{Data: data}
+	return Job{Data: data, Workers: make([]Worker, 500)}
 }
 
-// FindWorkerWithID checks to see if a worker has been already spawned for
-// the current job. Returns its index if so.
-func (j *Job) FindWorkerWithID(groupID int64) int {
-	for i, w := range j.Workers {
-		if w.GroupID == groupID {
-			return i
-		}
+// Object represents a single element in our input data.
+type Object struct {
+	ID   string `json:"id"`
+	Seq  int64  `json:"seq"`
+	Data string `json:"data"`
+}
+
+// GenerateGroupID returns the groupID that each object is grouped under
+// when assigned to a worker.
+func (o *Object) GenerateGroupID() int64 {
+	return o.Seq / int64(batchSize)
+}
+
+// GetIndex returns the modulo of each sequence based on the current batch size.
+// This makes up the index used to store the object in Worker.Objects
+func (o *Object) GetIndex() int64 {
+	return o.Seq % int64(batchSize)
+}
+
+// Message returns the concatenated string representation of fields id, seq & data.
+func (o *Object) Message() string {
+	return fmt.Sprintf("%s %d %s", o.ID, o.Seq, o.Data)
+}
+
+// Process will take an object and produce it as an entry for kafka topics.
+func (o *Object) Process() {
+	// partition := 0
+	// fmt.Println(o.Message())
+	config := sarama.NewConfig()
+	config.Producer.RequiredAcks = sarama.WaitForAll // Wait for all in-sync replicas to ack the message
+	config.Producer.Retry.Max = 10                   // Retry up to 10 times to produce the message
+	config.Producer.Return.Successes = true
+
+	conn, err := sarama.NewSyncProducer([]string{"127.0.0.1:9092"}, config)
+	if err != nil {
+		fmt.Println(err)
 	}
-	return -1
-}
 
-// Add new Worker to Job
-func (j *Job) Add(worker Worker) {
-	j.Workers = append(j.Workers, worker)
-}
+	msg := o.Message()
 
-// Run starts processing the dataset found in Job
-func (j *Job) Run() {
-	for _, obj := range j.Data.Objects {
-		groupID := obj.GenerateGroupID()
-
-		idx := j.FindWorkerWithID(groupID)
-		if idx == -1 {
-			worker := NewWorker(groupID)
-			j.Add(*worker)
-			idx = len(j.Workers) - 1
-		}
-
-		j.Workers[idx].Add(obj)
-
-		if j.Workers[idx].Size() >= batchSize {
-			j.Workers[idx].SortObjects()
-			j.Workers[idx].Process()
-		}
-	}
+	conn.SendMessage(&sarama.ProducerMessage{
+		Topic: topic,
+		Value: sarama.StringEncoder(msg),
+	})
 }
 
 // Worker is responsible for holding and processing a single batch of objects.
 type Worker struct {
-	GroupID int64
-	Objects []Object
+	GroupID    int64
+	Objects    []Object
+	Queue      chan Object
+	Done       chan bool
+	Killsignal chan bool
 }
 
 // NewWorker initializes a new Worker instance.
-func NewWorker(groupID int64) *Worker {
-	return &Worker{GroupID: groupID}
-}
-
-// Process all Objects in worker.
-func (w *Worker) Process() {
-	for _, obj := range w.Objects {
-		fmt.Println(obj)
+func NewWorker(queue chan Object, groupID int64, done, ks chan bool) *Worker {
+	return &Worker{
+		Queue:      queue,
+		GroupID:    groupID,
+		Done:       done,
+		Killsignal: ks,
+		Objects:    make([]Object, batchSize),
 	}
 }
 
-// Add new Object to Worker.
-func (w *Worker) Add(object Object) {
-	w.Objects = append(w.Objects, object)
+// Run allows the worker to listen on its Queue channel and process a batch when ready.
+func (w *Worker) Run() {
+	count := 0
+	for true {
+		if count == 100 {
+			for _, obj := range w.Objects {
+				obj.Process()
+				w.Done <- true
+			}
+		}
+		select {
+		case o := <-w.Queue:
+			// received new object from queue
+			idx := o.GetIndex()
+			w.Objects[idx] = o
+			count++
+		case <-w.Killsignal:
+			fmt.Printf("stopping worker with ID %d\n", w.GroupID)
+			return
+		}
+	}
 }
 
-// Size returns number of Objects in Worker.
-func (w *Worker) Size() int {
-	return len(w.Objects)
+// Run starts processing the dataset found in Job
+func (j *Job) Run() {
+	//channel for terminating the workers
+	killsig := make(chan bool)
+	done := make(chan bool)
+
+	for i := 0; i < numberOfWorkers; i++ {
+		q := make(chan Object)
+
+		worker := NewWorker(q, int64(i), done, killsig)
+		j.Workers[i] = *worker
+		go worker.Run()
+	}
+
+	for _, obj := range j.Data.Objects {
+		go func(obj Object) {
+			gid := obj.GenerateGroupID()
+			j.Workers[gid].Queue <- obj
+		}(obj)
+	}
+
+	// a deadlock occurs if c >= numberOfJobs
+	for c := 0; c < numberOfJobs; c++ {
+		<-done
+	}
+
+	fmt.Println("done!")
+
+	close(killsig)
+	time.Sleep(2 * time.Second)
 }
-
-// SortObjects sorts elements of Worker.Objects based on their Object.Seq value.
-// See section of BySeq for definition.
-func (w *Worker) SortObjects() {
-	sort.Sort(BySeq(w.Objects))
-}
-
-// BySeq is a custom implementation of sort. In which we sort elements of
-// Job.Objects in ascending order based on field Object.Seq.
-type BySeq []Object
-
-func (s BySeq) Len() int           { return len(s) }
-func (s BySeq) Less(i, j int) bool { return s[i].Seq < s[j].Seq }
-func (s BySeq) Swap(i, j int)      { s[i], s[j] = s[j], s[i] }
